@@ -7,10 +7,12 @@ from PyQt5.QtWidgets import QMainWindow, QApplication
 from PyQt5.QtCore import Qt
 import threading
 import time
-import random
 import sounddevice as sd
 import wave
 import sys
+import wave_solver as solver
+import test_wave_solver as test
+import engine_thing as engine
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -40,16 +42,17 @@ class MainWindow(QMainWindow):
         self.valve_angle = 0
         self.recording_buffer = np.array([])
         self.recording_number = 0
+        self.gain = 0.25
 
         # Configure simulation visualisation
-        self.sim_graph.setRange(xRange=[0, 3], yRange=[-5, 5])
+        self.sim_graph.setRange(xRange=[0, 3], yRange=[-3, 3])
         self.sim_graph.setMouseEnabled(x=False, y=False)
         self.sim_graph.setLabel(axis='left', text='u')
         self.sim_graph.setLabel(axis='bottom', text='x')
         self.sim_graph.hideButtons()
 
         # Configure midpoint visualisation
-        self.mid_graph.setRange(xRange=[-10000, 0], yRange=[-5, 5])
+        self.mid_graph.setRange(xRange=[-10000, 0], yRange=[-2.5, 2.5])
         self.mid_graph.setMouseEnabled(x=False, y=False)
         self.mid_graph.setLabel(axis='left', text='u')
         self.mid_graph.setLabel(axis='bottom', text='t')
@@ -68,6 +71,7 @@ class MainWindow(QMainWindow):
         self.is_recording = False
 
         # Set up threads
+        self._timer = None
         self.simulation = threading.Thread(target=self.simulation_thread, args=())
         self.visualisation = threading.Thread(target=self.visualisation_thread, args=())
         self.audio = threading.Thread(target=self.audio_thread, args=())
@@ -78,12 +82,38 @@ class MainWindow(QMainWindow):
     # Replace random values with function calls or don't I can't tell you what to do
     def simulation_thread(self):
         # Refresh simulation until keep alive expires
+        I = lambda x: 1E5
+        V = 0
+        f = 0
+        c = 402.317
+        U_L = 1E5
+        dt = 1/24000
+        L = 3
+        C = 1.0
+        
+        def U_0(t):
+            frac = (t * 1000 / 24) % 1
+            if frac <= 0.25:
+                return (1E5 + 69E3)        
+            else:
+                return (max((69E3*(-frac/0.25 + 2)),(0.0)) + 1E5)
+            
+        u, u_1, u_2, x, t, c, q, C2, B_p, B1, B_m, U_L, unused, I, V, f = solver.initial_conditioner(I, V, f, c, U_0, U_L, dt, C, L, safety_factor=0.7071, attenuation=True)
+        
         while self.keep_alive:
-            self.x = np.random.normal(size=1000)
-            self.u = np.random.normal(size=1000)
-
+            u, u_1, u_2, x, t, cpu_time = solver.single_timestep(I, V, f, U_0, U_L, dt, u, u_1, u_2, x, t, c, q, C2, B_p, B1, B_m)
+            self.x = x
+            self.u = (u - I(self.x))*(1.0/np.max(u))
+            
             # Define the sound array to be the u of the midpoint
-            self.sound_array = np.append(self.sound_array, self.u[len(self.u)//2])
+            u_aux = self.gain*np.power(self.u, 2)
+            
+         
+            self.sound_array = np.append(self.sound_array, (u_aux[len(u_aux)//2]))
+                
+            while len(self.sound_array) >= 3000 :
+                time.sleep(dt)
+            #time.sleep(max((dt - 0.9*(cpu_time + (time.perf_counter_ns() - t0))/1E9), 0.0))            
 
     def visualisation_thread(self):
         time.sleep(1/30)
@@ -126,24 +156,25 @@ class MainWindow(QMainWindow):
             while self.keep_alive:
                 sound_array = self.sound_array
 
-                if len(sound_array) > 120:
+                if len(sound_array) > 10:
                     # Create buffer out of evenly spaced sample of most recent midpoint data
                     if len(sound_array) < block_size:
                         buffer = sound_array
                     else:
+                        #Only good if the sound-array is not time dependent
                         buffer = sound_array[np.round(np.linspace(0, len(sound_array) - 1, block_size)).astype(int)]
 
                     # Ensure that sound array is not played empty
                     if len(sound_array) > 0:
                         # Add to recording buffer if needed
                         if self.is_recording:
-                            self.recording_buffer = np.append(self.recording_buffer, buffer/np.max(np.abs(buffer))).astype('float32')
+                            self.recording_buffer = np.append(self.recording_buffer, buffer).astype('float32')
 
                         # Clear external buffer
                         self.sound_array = np.array([])
-
+                        
                         # Write to stream
-                        stream.write((buffer/np.max(np.abs(buffer))).astype('float32'))
+                        stream.write(buffer.astype('float32'))
                     
     def save_audio(self):
         # Scale buffer
@@ -205,6 +236,7 @@ class MainWindow(QMainWindow):
         self.keep_alive = False
 
         event.accept()
+        exit()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
@@ -213,3 +245,4 @@ if __name__ == '__main__':
     main.setWindowTitle("The Tube Simulator 9000")
     main.show()
     sys.exit(app.exec_())
+    exit()
