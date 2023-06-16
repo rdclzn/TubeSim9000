@@ -1,5 +1,6 @@
 import numpy as np
 import math
+
 from pathlib import Path
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore
@@ -37,12 +38,14 @@ class MainWindow(QMainWindow):
 
         # Initialise arrays and variables
         self.sound_array = np.array([])
-        self.x = np.array([])
-        self.u = np.array([])
+        self.x = np.array([[]])
+        self.u = np.array([[]])
+        self.t = np.array([[]])
         self.valve_angle = 0
         self.recording_buffer = np.array([])
         self.recording_number = 0
-        self.gain = 0.25
+        self.gain = 0.5
+        self.size_midpoint = 3.0
 
         # Configure simulation visualisation
         self.sim_graph.setRange(xRange=[0, 3], yRange=[-3, 3])
@@ -52,7 +55,7 @@ class MainWindow(QMainWindow):
         self.sim_graph.hideButtons()
 
         # Configure midpoint visualisation
-        self.mid_graph.setRange(xRange=[-10000, 0], yRange=[-2.5, 2.5])
+        self.mid_graph.setRange(xRange=[-self.size_midpoint, 0], yRange=[-2.0, 2.0])
         self.mid_graph.setMouseEnabled(x=False, y=False)
         self.mid_graph.setLabel(axis='left', text='u')
         self.mid_graph.setLabel(axis='bottom', text='t')
@@ -99,49 +102,52 @@ class MainWindow(QMainWindow):
                 return (max((69E3*(-frac/0.25 + 2)),(0.0)) + 1E5)
             
         u, u_1, u_2, x, t, c, q, C2, B_p, B1, B_m, U_L, unused, I, V, f = solver.initial_conditioner(I, V, f, c, U_0, U_L, dt, C, L, safety_factor=0.7071, attenuation=True)
+        self.x = np.append(self.x, x)
+        self.t = np.append(self.t, t) 
+        self.u = np.append(self.u, (u - I(x))/(I(x)))
         
         while self.keep_alive:
             u, u_1, u_2, x, t, cpu_time = solver.single_timestep(I, V, f, U_0, U_L, dt, u, u_1, u_2, x, t, c, q, C2, B_p, B1, B_m)
-            self.x = x
-            self.u = (u - I(self.x))*(1.0/np.max(u))
+            self.x = np.vstack((self.x, np.atleast_2d(x)))
+            self.t = np.vstack((self.t, np.atleast_2d(t)))
+            self.u = np.vstack((self.u, np.atleast_2d(u - I(x))/np.max(I(x))))
             
             # Define the sound array to be the u of the midpoint
-            u_aux = self.gain*np.power(self.u, 2)
+            u_aux = np.power(u[len(u)//2]/np.max(u), 2)
             
          
-            self.sound_array = np.append(self.sound_array, (u_aux[len(u_aux)//2]))
-                
-            while len(self.sound_array) >= 3000 :
-                time.sleep(dt)
-            #time.sleep(max((dt - 0.9*(cpu_time + (time.perf_counter_ns() - t0))/1E9), 0.0))            
+            self.sound_array = np.append(self.sound_array, u_aux)
+            while (self.sound_array.size) >= 3000 :
+                print("hmm")
+                time.sleep(dt)        
 
     def visualisation_thread(self):
         time.sleep(1/30)
 
         # Initialise arrays
         sound_vis_array = np.array([])
-        sound_vis_x = np.array([])
+        sound_vis_x = np.arange(-self.size_midpoint,0,1/30)
 
         # Start graphics
         while self.keep_alive:
             # Update simulation plot
-            self.sim_curve.setData(self.x, self.u)
-
+            self.sim_curve.setData(self.x[-1, :], self.u[-1, :])
+            
             # Update midpoint plot
-            if len(sound_vis_array) == 300:
-                sound_vis_array = np.append(sound_vis_array[1:], self.sound_array[-1:])
+            if len(sound_vis_array) >= self.size_midpoint:
+                sound_vis_array = np.append(sound_vis_array[1:], self.sound_array[-1])
+                
             else:
-                sound_vis_array = np.append(sound_vis_array, self.sound_array[-1:])
-                while len(sound_vis_x) < len(sound_vis_array):
-                    sound_vis_x = np.append(1000 * -len(sound_vis_array)/30, sound_vis_x)
-            self.mid_curve.setData(sound_vis_x[:len(sound_vis_array)], sound_vis_array)
+                sound_vis_array = np.append(sound_vis_array, self.sound_array[-1])
+
+            self.mid_curve.setData(sound_vis_x[-len(sound_vis_array):], sound_vis_array)
 
             # Loop every 30th of a second until keep alive expires
             time.sleep(1/30)
 
     def audio_thread(self):
         time.sleep(0.1)
-
+        
         # Set up stream
         block_size = 3000
         sample_rate = 12000
@@ -150,32 +156,43 @@ class MainWindow(QMainWindow):
             channels=1,
             dtype=np.float32,
         )
-
+        buffer = np.array([])
         # Start stream
         with stream:
+            t0 = time.perf_counter()
+            
             while self.keep_alive:
-                sound_array = self.sound_array
-
-                if len(sound_array) > 10:
-                    # Create buffer out of evenly spaced sample of most recent midpoint data
-                    if len(sound_array) < block_size:
-                        buffer = sound_array
-                    else:
-                        #Only good if the sound-array is not time dependent
-                        buffer = sound_array[np.round(np.linspace(0, len(sound_array) - 1, block_size)).astype(int)]
-
-                    # Ensure that sound array is not played empty
-                    if len(sound_array) > 0:
-                        # Add to recording buffer if needed
-                        if self.is_recording:
-                            self.recording_buffer = np.append(self.recording_buffer, buffer).astype('float32')
-
-                        # Clear external buffer
-                        self.sound_array = np.array([])
+                t = time.perf_counter()
+                sound_array = self.sound_array.copy()
+                
+                if stream.write_available > 0 and sound_array.size > 0:
+                    if sound_array.size > 100:
+                        frames = int(min(stream.write_available,100))
+                        buffer = sound_array[:frames].copy()
                         
                         # Write to stream
                         stream.write(buffer.astype('float32'))
-                    
+                    else :                        
+                        buffer = sound_array[:stream.write_available].copy()
+                        
+                        # Write to stream
+                        stream.write(buffer.astype('float32'))
+                
+                # Ensure that sound array is not played empty
+                if sound_array.size > 0:
+                    # Add to recording buffer if needed
+                    if self.is_recording:
+                        self.recording_buffer = np.append(self.recording_buffer, buffer).astype('float32')
+                        
+                frames = np.argwhere(t < (t - t0))
+
+                if frames.size > 0:                    
+                    if frames[0, 0] > sound_array.shape[0] :
+                        self.sound_array = self.sound_array[(frames[0, 0] - 1):]
+                    else:
+                        self.sound_array = self.sound_array[(frames[0, 0]):]
+
+                
     def save_audio(self):
         # Scale buffer
         buffer = np.int16(self.recording_buffer * 32767)
